@@ -4,7 +4,7 @@ use crate::slice_tracker::SliceTracker;
 use std::sync::atomic::Ordering;
 use std::cell::UnsafeCell;
 
-pub mod normal;
+// pub mod normal;
 pub mod streaming;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -33,18 +33,16 @@ pub(crate) struct ChunkVisit {
 }
 
 impl ChunkVisit {
-    pub fn create_range<'a, Lock: RawRwLock, T, const SLICES: usize>(
+    // SAFETY: Assumes we have an active read lock for the candy cane.
+    pub unsafe fn create_range<Lock: RawRwLock, T, const SLICES: usize>(
         start: usize,
         end: usize,
-        slice_buffer: &mut Vec<Self>,
-        buffer: &'a RawCandyCane<Lock, T, SLICES>,
-    ) -> &'a [SliceTracker<Lock, T>] {
+        buffer: &RawCandyCane<Lock, T, SLICES>,
+    ) -> (Vec<ChunkVisitRange>, usize) {
         let start_slice = buffer.calc_slice_index(start);
         let mut end_slice = buffer.calc_slice_index(end);
         assert!(end_slice >= start_slice);
         assert!(end_slice <= SLICES);
-
-        let len_per_slice = buffer.len_per_slice.load(Ordering::Acquire);
 
         // Adjust if we are dealing with the last (and longer) slice.
         if end_slice == SLICES {
@@ -52,54 +50,33 @@ impl ChunkVisit {
         }
 
         if start_slice == end_slice {
-            let slices = &buffer.slices[start_slice..=start_slice];
-            let slice_offset = start_slice * len_per_slice;
-            let start = start - slice_offset;
-            let end = end - slice_offset;
-            slice_buffer.push(ChunkVisit {
-                chunk_id: 0,
-                range: ChunkVisitRange::Inside(start, end),
-            });
-            return unsafe { unsafe_cell_to_ref(slices) };
+            let range = ChunkVisitRange::Inside(start, end);
+            return (vec![range], start_slice);
         }
 
-        let slices = &buffer.slices[start_slice..=end_slice];
+        let ranges = (start_slice..=end_slice)
+            .map(|slice_index| {
+                if slice_index == start_slice {
+                    ChunkVisitRange::Last { start }
+                } else if slice_index == end_slice {
+                    ChunkVisitRange::First { end }
+                } else {
+                    ChunkVisitRange::All
+                }
+            })
+            .collect();
 
-        for (buffer_index, slice_index) in (start_slice..=end_slice).enumerate() {
-            if slice_index == start_slice {
-                let start_slice_offset = start_slice * len_per_slice;
-                let start = start - start_slice_offset;
-                slice_buffer.push(ChunkVisit {
-                    chunk_id: buffer_index,
-                    range: ChunkVisitRange::Last { start },
-                });
-            } else if slice_index == end_slice {
-                let end_slice_offset = end_slice * len_per_slice;
-                let end = end - end_slice_offset;
-                slice_buffer.push(ChunkVisit {
-                    chunk_id: buffer_index,
-                    range: ChunkVisitRange::First { end },
-                });
-            } else {
-                slice_buffer.push(ChunkVisit {
-                    chunk_id: buffer_index,
-                    range: ChunkVisitRange::All,
-                })
-            }
-        }
-
-        unsafe {
-            // SAFETY: `UnsafeCell` is `repr(transparent)`.
-            unsafe_cell_to_ref(slices)
-        }
+        (ranges, start_slice)
     }
+}
 
-    fn slice<'a, T>(&self, slice: &'a [T]) -> &'a [T] {
-        match self.range {
-            ChunkVisitRange::All => slice,
+impl ChunkVisitRange {
+    pub(crate) fn slice<'a, T>(&self, start: usize, length: usize, slice: &'a [T]) -> &'a [T] {
+        match *self {
+            ChunkVisitRange::All => &slice[start..start + length],
             ChunkVisitRange::Inside(s, e) => &slice[s..=e],
-            ChunkVisitRange::First { end } => &slice[..=end],
-            ChunkVisitRange::Last { start } => &slice[start..],
+            ChunkVisitRange::First { end: r_end } => &slice[start..=r_end],
+            ChunkVisitRange::Last { start: r_start } => &slice[r_start..start + length],
         }
     }
 }

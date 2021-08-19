@@ -15,26 +15,19 @@ use std::ptr::NonNull;
 /// this struct, and `data` is only valid to be
 /// read while `all_state` allows us to read.
 ///
-pub struct SliceTracker<R: RawRwLock, T> {
-    pub(crate) data: NonNull<UnsafeCell<T>>,
+pub struct SliceTracker<R: RawRwLock> {
+    pub(crate) start: usize,
     pub(crate) length: usize,
     pub(crate) lock: R,
 }
 
-// SAFETY: T need not be Sync, since we check for
-// T: Sync before we hand out any &T.
-unsafe impl<R: Sync + RawRwLock, T> Sync for SliceTracker<R, T> {}
-// SAFETY: T need not be Send, since we check for
-// T: Send before we hand out any &mut T.
-unsafe impl<R: Send + Sync + RawRwLock, T> Send for SliceTracker<R, T> {}
-
-impl<R: RawRwLock, T> SliceTracker<R, T> {
+impl<R: RawRwLock> SliceTracker<R> {
     /// SAFETY: `data`, and `length` must be valid
     /// and not overlap with any other `SliceTracker`s
     /// in the same collection.
-    pub unsafe fn new(data: *const UnsafeCell<T>, length: usize) -> Self {
+    pub unsafe fn new(start: usize, length: usize) -> Self {
         Self {
-            data: NonNull::new_unchecked(data as *mut _),
+            start,
             length,
             lock: R::INIT,
         }

@@ -5,23 +5,33 @@ use parking_lot::RawRwLock as RwLock;
 use std::cell::UnsafeCell;
 use std::ops::{Bound, RangeBounds};
 use super::ChunkVisit;
+use crate::iter::ChunkVisitRange;
+use std::collections::HashMap;
+use atomic_deque::{AtomicDeque, Link};
 
-pub struct RawCandyCaneIterStreaming<'a, R: RawRwLock, T> {
-    slices: &'a [SliceTracker<R, T>],
-    #[allow(dead_code)]
-    all_lock: LockGuard<'a, R>,
-    pub(crate) chunks_to_visit: Vec<ChunkVisit>,
-    internal: Option<(std::slice::Iter<'a, UnsafeCell<T>>, LockGuard<'a, R>)>,
+#[inline]
+#[cold]
+fn cold() {}
+
+fn id() -> String {
+    format!("{:?}", std::thread::current().id())
 }
 
-impl<'a, Lock: RawRwLock, T> RawCandyCaneIterStreaming<'a, Lock, T> {
-    pub fn new_over<R: RangeBounds<usize>, const SLICES: usize>(
+pub struct RawCandyCaneIterStreaming<'a, R: RawRwLock, T, const N: usize> {
+    slices: HashMap<usize, ChunkVisitRange>,
+    slice_buffer: &'a AtomicDeque<SliceTracker<R>, N>,
+    #[allow(dead_code)]
+    all_lock: LockGuard<'a, R>,
+    all_data: &'a [UnsafeCell<T>],
+    internal: Option<(std::slice::Iter<'a, UnsafeCell<T>>, Link<SliceTracker<R>>)>,
+}
+
+impl<'a, Lock: RawRwLock, T, const N: usize> RawCandyCaneIterStreaming<'a, Lock, T, N> {
+    pub fn new_over<R: RangeBounds<usize>>(
         range: R,
-        buffer: &'a RawCandyCane<Lock, T, SLICES>,
+        buffer: &'a RawCandyCane<Lock, T, N>,
     ) -> Self {
         let guard = buffer.lock_internal_for_read();
-
-        let mut chunk_buffer = Vec::new();
 
         let start = range.start_bound();
         let end = range.end_bound();
@@ -42,16 +52,23 @@ impl<'a, Lock: RawRwLock, T> RawCandyCaneIterStreaming<'a, Lock, T> {
         assert!(start <= end);
         assert!(end <= len);
 
-        let slices = if start == end {
-            &[][..]
+        let (ranges, start_slice) = if start == end {
+            (vec![], 0)
         } else {
-            ChunkVisit::create_range(start, end, &mut chunk_buffer, &buffer)
+            unsafe {
+                ChunkVisit::create_range(start, end, &buffer)
+            }
         };
 
+        let slices = ranges.into_iter().enumerate().map(|(i, r)| (i + start_slice, r)).collect();
+        // println!("Slices are {:?} on {}", &slices, id());
         Self {
             slices,
+            slice_buffer: &buffer.slices,
             all_lock: guard,
-            chunks_to_visit: chunk_buffer,
+            all_data: unsafe {
+                &*buffer.data.get()
+            },
             internal: None,
         }
     }
@@ -61,66 +78,65 @@ impl<'a, Lock: RawRwLock, T> RawCandyCaneIterStreaming<'a, Lock, T> {
         match self.internal.as_mut().and_then(|(iter, _)| iter.next()) {
             Some(x) => Some(x.get()),
             None => {
-                drop(self.internal.take());
-                // First, we try looking for a free chunk to access.
-                for index in (0..self.chunks_to_visit.len()).rev() {
-                    let chunk = &self.slices[self.chunks_to_visit[index].chunk_id];
-                    // println!("{:?} trying {} @ {}", std::thread::current().id(), index, self.chunks_to_visit[index].chunk_id);
-                    if let Some(guard) = chunk.try_lock(lock_type) {
-                        // println!("{:?} try_lock-ed on {} @ {}", std::thread::current().id(), index, self.chunks_to_visit[index].chunk_id);
-                        let slice = unsafe {
-                            let slice =
-                                std::slice::from_raw_parts(chunk.data.as_ptr(), chunk.length);
-                            self.chunks_to_visit[index].slice(slice)
-                        };
-                        let mut iter = slice.iter();
-                        self.chunks_to_visit.remove(index);
-                        let item = match iter.next() {
-                            Some(x) => x,
-                            None => continue,
-                        };
+                cold();
+                self
+                    .internal
+                    .take()
+                    .map(|(_, link)| self.slice_buffer.deposit(link));
 
-                        // println!("{:?} using {}", std::thread::current().id(), index);
-
-                        self.internal = Some((iter, guard));
-                        return Some(item.get());
-                    }
+                if self.slices.len() == 0 {
+                    // println!("Slices are empty on {}", id());
+                    return None;
                 }
 
-                // If all of them are occupied, we simply wait on
-                // the next available one.
-                while let Some(chunk) = self.chunks_to_visit.pop() {
-                    // println!("{:?} locking on {}", std::thread::current().id(), chunk.chunk_id);
+                let mut range = None;
 
-                    let tracker = &self.slices[chunk.chunk_id];
-                    let guard = tracker.lock(lock_type);
+                let next_slice = self.slice_buffer.predicate_next_wait(|slice_tracker, index| {
+                    // println!("Testing {} on {}", index, id());
+                    if self.slices.contains_key(&index) {
+                        // println!("Succeeded on {} on {}", index, id());
+                        range = self.slices.remove(&index);
+                        if slice_tracker.length == 0 {
+                            // println!("Chunk length was 0 on {}", id());
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                });
 
-                    let slice = unsafe {
-                        let slice =
-                            std::slice::from_raw_parts(tracker.data.as_ptr(), tracker.length);
-                        chunk.slice(slice)
-                    };
+                if let (Some(range), Some(chunk)) = (range, next_slice) {
+                    let slice = range.slice(chunk.start, chunk.length, &self.all_data);
+
                     let mut iter = slice.iter();
-                    let item = match iter.next() {
+
+                    let next = iter.next();
+                    if next.is_none() {
+                        cold();
+                    }
+                    let item = match next {
                         Some(x) => x,
-                        None => continue,
+                        None => panic!(),
                     };
 
-                    self.internal = Some((iter, guard));
+                    self.internal = Some((iter, chunk));
                     return Some(item.get());
                 }
 
+                // println!("Range and chunk were None on {}: {:?}", id(), &self.slices);
                 None
             }
         }
     }
 }
 
-pub struct CandyCaneIterStreaming<'a, T: Sync, R: RawRwLock = RwLock> {
-    pub(crate) inner: RawCandyCaneIterStreaming<'a, R, T>,
+pub struct CandyCaneIterStreaming<'a, T: Sync, R: RawRwLock, const N: usize> {
+    pub(crate) inner: RawCandyCaneIterStreaming<'a, R, T, N>,
 }
 
-impl<'a, T: Sync, R: RawRwLock> CandyCaneIterStreaming<'a, T, R> {
+impl<'a, T: Sync, R: RawRwLock, const N: usize> CandyCaneIterStreaming<'a, T, R, N> {
     #[inline]
     pub fn next(&mut self) -> Option<&T> {
         // SAFETY: The internal iterator should only
@@ -131,11 +147,11 @@ impl<'a, T: Sync, R: RawRwLock> CandyCaneIterStreaming<'a, T, R> {
     }
 }
 
-pub struct CandyCaneIterStreamingMut<'a, T: Send, R: RawRwLock = RwLock> {
-    pub(crate) inner: RawCandyCaneIterStreaming<'a, R, T>,
+pub struct CandyCaneIterStreamingMut<'a, T: Send, R: RawRwLock, const N: usize> {
+    pub(crate) inner: RawCandyCaneIterStreaming<'a, R, T, N>,
 }
 
-impl<'a, T: Send, R: RawRwLock> CandyCaneIterStreamingMut<'a, T, R> {
+impl<'a, T: Send, R: RawRwLock, const N: usize> CandyCaneIterStreamingMut<'a, T, R, N> {
     #[inline]
     pub fn next(&mut self) -> Option<&mut T> {
         // SAFETY: The internal iterator should only

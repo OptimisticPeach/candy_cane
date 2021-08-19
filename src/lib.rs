@@ -12,7 +12,8 @@ use std::mem::MaybeUninit;
 use std::ops::{RangeBounds, DerefMut, Deref};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use crate::iter::normal::{CandyCaneIter, RawCandyCaneIter, CandyCaneIterMut};
+use atomic_deque::AtomicDeque;
+// use crate::iter::normal::{CandyCaneIter, RawCandyCaneIter, CandyCaneIterMut};
 
 pub type CandyCane<T> = RawCandyCane<parking_lot::RawRwLock, T, 6>;
 
@@ -25,7 +26,7 @@ unsafe fn assume_init_array<T, const LEN: usize>(from: [MaybeUninit<T>; LEN]) ->
 
 pub struct RawCandyCane<R: RawRwLock, T, const SLICES: usize> {
     data: UnsafeCell<Vec<UnsafeCell<T>>>,
-    slices: [UnsafeCell<SliceTracker<R, T>>; SLICES],
+    slices: AtomicDeque<SliceTracker<R>, SLICES>,
     /// Self explanatory (len / SLICES).
     len_per_slice: AtomicUsize,
     // SAFETY: `all_lock` must be boxed to ensure
@@ -46,14 +47,14 @@ impl<R: RawRwLock, T, const SLICES: usize> RawCandyCane<R, T, SLICES> {
         let rwlock = R::INIT;
 
         // SAFETY: `MaybeUninit` does not require initialization.
-        let mut slices: [MaybeUninit<UnsafeCell<SliceTracker<R, T>>>; SLICES] =
+        let mut slices: [MaybeUninit<SliceTracker<R>>; SLICES] =
             unsafe { MaybeUninit::uninit().assume_init() };
 
         for slice in &mut slices[..] {
             // SAFETY: None of the `SliceTracker`s will overlap
             // since they all have length 0.
             unsafe {
-                *slice = MaybeUninit::new(UnsafeCell::new(SliceTracker::new(data.as_ptr(), 0)));
+                *slice = MaybeUninit::new(SliceTracker::new(0, 0));
             }
         }
 
@@ -63,7 +64,7 @@ impl<R: RawRwLock, T, const SLICES: usize> RawCandyCane<R, T, SLICES> {
 
         Self {
             data: UnsafeCell::new(data),
-            slices,
+            slices: AtomicDeque::new(slices),
             len_per_slice: AtomicUsize::new(0),
             all_lock: rwlock,
             is_waiting_mut: Mutex::new(false),
@@ -95,7 +96,7 @@ impl<R: RawRwLock, T, const SLICES: usize> RawCandyCane<R, T, SLICES> {
         Self {
             data: UnsafeCell::new(data),
             len_per_slice: AtomicUsize::new(per_slice),
-            slices,
+            slices: AtomicDeque::new(slices),
             all_lock: rwlock,
             is_waiting_mut: Mutex::new(false),
             waiting_mut_wakeup: Condvar::new(),
@@ -159,26 +160,33 @@ impl<R: RawRwLock, T, const SLICES: usize> RawCandyCane<R, T, SLICES> {
 
     pub(crate) fn reconstruct_chunks<'a>(&'a self, lock: &LockGuard<'a, R>) {
         assert!(self.ensure_my_write_guard(&lock));
+        assert_eq!(self.slices.len(), SLICES);
 
         // SAFETY: We ensured that the lock we were given is for our lock.
         let data = unsafe { &*self.data.get() };
 
         let (slices, per_chunk) = Self::create_slices(&data);
+        let mut slices = slices.map(|x| Some(x));
 
-        for (dest, src) in self.slices.iter().zip(std::array::IntoIter::new(slices)) {
-            unsafe {
-                *dest.get() = src.into_inner();
-            }
+        let mut links = Vec::new();
+
+        while let Some(mut link) = self.slices.next_try() {
+            *link = slices[link.original_index()].take().unwrap();
+            links.push(link);
         }
+
+        links
+            .into_iter()
+            .for_each(|x| self.slices.deposit(x));
 
         // Does ordering matter here? Since nothing should
         // be reading this value right now.
         self.len_per_slice.store(per_chunk, Ordering::Release);
     }
 
-    fn create_slices(data: &Vec<UnsafeCell<T>>) -> ([UnsafeCell<SliceTracker<R, T>>; SLICES], usize) {
+    fn create_slices(data: &Vec<UnsafeCell<T>>) -> ([SliceTracker<R>; SLICES], usize) {
         // SAFETY: `MaybeUninit` does not require initialization.
-        let mut slices: [MaybeUninit<UnsafeCell<SliceTracker<R, T>>>; SLICES] =
+        let mut slices: [MaybeUninit<SliceTracker<R>>; SLICES] =
             unsafe { MaybeUninit::uninit().assume_init() };
 
         let per_slice = data.len() / SLICES;
@@ -188,10 +196,10 @@ impl<R: RawRwLock, T, const SLICES: usize> RawCandyCane<R, T, SLICES> {
         for slice in &mut slices[..SLICES - 1] {
             // SAFETY: None of the `SliceTracker`s should overlap
             unsafe {
-                *slice = MaybeUninit::new(UnsafeCell::new(SliceTracker::new(
-                    data.as_ptr().add(running_total),
+                *slice = MaybeUninit::new(SliceTracker::new(
+                    running_total,
                     per_slice,
-                )));
+                ));
             }
 
             running_total += per_slice;
@@ -200,10 +208,10 @@ impl<R: RawRwLock, T, const SLICES: usize> RawCandyCane<R, T, SLICES> {
         // SAFETY: None of the `SliceTracker`s should overlap with
         // the last one.
         unsafe {
-            slices[SLICES - 1] = MaybeUninit::new(UnsafeCell::new(SliceTracker::new(
-                data.as_ptr().add(running_total),
+            slices[SLICES - 1] = MaybeUninit::new(SliceTracker::new(
+                running_total,
                 per_slice + last_extra,
-            )));
+            ));
         }
 
         // SAFETY: `slices` was initialized by the previous
@@ -240,27 +248,27 @@ impl<R: RawRwLock, T, const SLICES: usize> RawCandyCane<R, T, SLICES> {
 }
 
 impl<R: RawRwLock, T: Sync, const SLICES: usize> RawCandyCane<R, T, SLICES> {
-    pub fn iter_streaming(&self, range: impl RangeBounds<usize>) -> CandyCaneIterStreaming<'_, T, R> {
+    pub fn iter_streaming(&self, range: impl RangeBounds<usize>) -> CandyCaneIterStreaming<'_, T, R, SLICES> {
         let internal = RawCandyCaneIterStreaming::new_over(range, self);
         CandyCaneIterStreaming { inner: internal }
     }
 
-    pub fn iter(&self, range: impl RangeBounds<usize>) -> CandyCaneIter<'_, T, R> {
-        let internal = RawCandyCaneIter::new_over(range, self);
-        CandyCaneIter { inner: internal }
-    }
+    // pub fn iter(&self, range: impl RangeBounds<usize>) -> CandyCaneIter<'_, T, R> {
+    //     let internal = RawCandyCaneIter::new_over(range, self);
+    //     CandyCaneIter { inner: internal }
+    // }
 }
 
 impl<R: RawRwLock, T: Send, const SLICES: usize> RawCandyCane<R, T, SLICES> {
-    pub fn iter_streaming_mut(&self, range: impl RangeBounds<usize>) -> CandyCaneIterStreamingMut<'_, T, R> {
+    pub fn iter_streaming_mut(&self, range: impl RangeBounds<usize>) -> CandyCaneIterStreamingMut<'_, T, R, SLICES> {
         let internal = RawCandyCaneIterStreaming::new_over(range, self);
         CandyCaneIterStreamingMut { inner: internal }
     }
 
-    pub fn iter_mut(&self, range: impl RangeBounds<usize>) -> CandyCaneIterMut<'_, T, R> {
-        let internal = RawCandyCaneIter::new_over(range, self);
-        CandyCaneIterMut { inner: internal }
-    }
+    // pub fn iter_mut(&self, range: impl RangeBounds<usize>) -> CandyCaneIterMut<'_, T, R> {
+    //     let internal = RawCandyCaneIter::new_over(range, self);
+    //     CandyCaneIterMut { inner: internal }
+    // }
 }
 
 unsafe impl<R: RawRwLock, T, const SLICES: usize> Sync for RawCandyCane<R, T, SLICES> {}
@@ -349,17 +357,19 @@ mod unit_tests {
         let mut iter = candy_cane.iter_streaming(..);
         let mut sum = 0;
         let mut count = 0;
+        let mut last = 0;
         while let Some(item) = iter.next() {
             sum += *item;
             count += 1;
+            last = *item;
         }
 
         assert_eq!(count, 4000);
         assert_eq!(sum, (3999 * 4000) / 2);
 
-        let (sum, count) = candy_cane
-            .iter(..)
-            .fold((0, 0), |(sum, count), val| (sum + *val, count + 1));
+        // let (sum, count) = candy_cane
+        //     .iter(..)
+        //     .fold((0, 0), |(sum, count), val| (sum + *val, count + 1));
 
         assert_eq!(count, 4000);
         assert_eq!(sum, (3999 * 4000) / 2);
@@ -402,7 +412,9 @@ mod unit_tests {
             .map(|_| {
                 let clone = Arc::clone(&candy_cane);
                 std::thread::spawn(move || {
+                    // println!("Created {:?}", std::thread::current().id());
                     iter_and_add(&*clone);
+                    // println!("Finished {:?}", std::thread::current().id());
                 })
             })
             .collect::<Vec<_>>();
@@ -448,9 +460,9 @@ mod unit_tests {
         assert_eq!(count, 4000);
         assert_eq!(sum, (3999 * 4000) / 2);
 
-        let (sum, count) = candy_cane
-            .iter_mut(..)
-            .fold((0, 0), |(sum, count), val| (sum + *val, count + 1));
+        // let (sum, count) = candy_cane
+        //     .iter_mut(..)
+        //     .fold((0, 0), |(sum, count), val| (sum + *val, count + 1));
 
         assert_eq!(count, 4000);
         assert_eq!(sum, (3999 * 4000) / 2);
