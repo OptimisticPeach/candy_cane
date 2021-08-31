@@ -1,6 +1,7 @@
-use parking_lot::lock_api::RawRwLock;
+use parking_lot::lock_api::{RawRwLock, RawMutex};
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
+use parking_lot::lock_api::{Mutex, MutexGuard};
 
 ///
 /// SAFETY: The contents of `data` should only
@@ -15,20 +16,20 @@ use std::ptr::NonNull;
 /// this struct, and `data` is only valid to be
 /// read while `all_state` allows us to read.
 ///
-pub struct SliceTracker<R: RawRwLock, T> {
+pub struct SliceTracker<M: RawMutex, T> {
     pub(crate) data: NonNull<UnsafeCell<T>>,
     pub(crate) length: usize,
-    pub(crate) lock: R,
+    pub(crate) lock: Mutex<M, ()>,
 }
 
 // SAFETY: T need not be Sync, since we check for
 // T: Sync before we hand out any &T.
-unsafe impl<R: Sync + RawRwLock, T> Sync for SliceTracker<R, T> {}
+unsafe impl<M: Sync + RawMutex, T> Sync for SliceTracker<M, T> {}
 // SAFETY: T need not be Send, since we check for
 // T: Send before we hand out any &mut T.
-unsafe impl<R: Send + Sync + RawRwLock, T> Send for SliceTracker<R, T> {}
+unsafe impl<M: Send + Sync + RawMutex, T> Send for SliceTracker<M, T> {}
 
-impl<R: RawRwLock, T> SliceTracker<R, T> {
+impl<M: RawMutex, T> SliceTracker<M, T> {
     /// SAFETY: `data`, and `length` must be valid
     /// and not overlap with any other `SliceTracker`s
     /// in the same collection.
@@ -36,16 +37,16 @@ impl<R: RawRwLock, T> SliceTracker<R, T> {
         Self {
             data: NonNull::new_unchecked(data as *mut _),
             length,
-            lock: R::INIT,
+            lock: Default::default(),
         }
     }
 
-    pub fn lock(&self, kind: LockGuardType) -> LockGuard<'_, R> {
-        LockGuard::lock(&self.lock, kind)
+    pub fn lock(&self) -> MutexGuard<'_, M, ()> {
+        self.lock.lock()
     }
 
-    pub fn try_lock(&self, kind: LockGuardType) -> Option<LockGuard<'_, R>> {
-        LockGuard::try_lock(&self.lock, kind)
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, M, ()>> {
+        self.lock.try_lock()
     }
 }
 

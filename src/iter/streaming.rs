@@ -1,23 +1,23 @@
-use crate::slice_tracker::{LockGuard, LockGuardType, SliceTracker};
+use crate::slice_tracker::{LockGuard, SliceTracker};
 use crate::RawCandyCane;
-use parking_lot::lock_api::RawRwLock;
+use parking_lot::lock_api::{RawRwLock, MutexGuard, RawMutex};
 use parking_lot::RawRwLock as RwLock;
 use std::cell::UnsafeCell;
 use std::ops::{Bound, RangeBounds};
 use super::ChunkVisit;
 
-pub struct RawCandyCaneIterStreaming<'a, R: RawRwLock, T> {
-    slices: &'a [SliceTracker<R, T>],
+pub struct RawCandyCaneIterStreaming<'a, R: RawRwLock, M: RawMutex, T> {
+    slices: &'a [SliceTracker<M, T>],
     #[allow(dead_code)]
     all_lock: LockGuard<'a, R>,
     pub(crate) chunks_to_visit: Vec<ChunkVisit>,
-    internal: Option<(std::slice::Iter<'a, UnsafeCell<T>>, LockGuard<'a, R>)>,
+    internal: Option<(std::slice::Iter<'a, UnsafeCell<T>>, MutexGuard<'a, M, ()>)>,
 }
 
-impl<'a, Lock: RawRwLock, T> RawCandyCaneIterStreaming<'a, Lock, T> {
+impl<'a, Rw: RawRwLock, Mtx: RawMutex, T> RawCandyCaneIterStreaming<'a, Rw, Mtx, T> {
     pub fn new_over<R: RangeBounds<usize>, const SLICES: usize>(
         range: R,
-        buffer: &'a RawCandyCane<Lock, T, SLICES>,
+        buffer: &'a RawCandyCane<Rw, Mtx, T, SLICES>,
     ) -> Self {
         let guard = buffer.lock_internal_for_read();
 
@@ -56,7 +56,7 @@ impl<'a, Lock: RawRwLock, T> RawCandyCaneIterStreaming<'a, Lock, T> {
         }
     }
 
-    pub fn next_raw(&mut self, lock_type: LockGuardType) -> Option<*mut T> {
+    pub fn next_raw(&mut self) -> Option<*mut T> {
         // println!("Running next");
         match self.internal.as_mut().and_then(|(iter, _)| iter.next()) {
             Some(x) => Some(x.get()),
@@ -66,7 +66,7 @@ impl<'a, Lock: RawRwLock, T> RawCandyCaneIterStreaming<'a, Lock, T> {
                 for index in (0..self.chunks_to_visit.len()).rev() {
                     let chunk = &self.slices[self.chunks_to_visit[index].chunk_id];
                     // println!("{:?} trying {} @ {}", std::thread::current().id(), index, self.chunks_to_visit[index].chunk_id);
-                    if let Some(guard) = chunk.try_lock(lock_type) {
+                    if let Some(guard) = chunk.try_lock() {
                         // println!("{:?} try_lock-ed on {} @ {}", std::thread::current().id(), index, self.chunks_to_visit[index].chunk_id);
                         let slice = unsafe {
                             let slice =
@@ -93,7 +93,7 @@ impl<'a, Lock: RawRwLock, T> RawCandyCaneIterStreaming<'a, Lock, T> {
                     // println!("{:?} locking on {}", std::thread::current().id(), chunk.chunk_id);
 
                     let tracker = &self.slices[chunk.chunk_id];
-                    let guard = tracker.lock(lock_type);
+                    let guard = tracker.lock();
 
                     let slice = unsafe {
                         let slice =
@@ -116,32 +116,32 @@ impl<'a, Lock: RawRwLock, T> RawCandyCaneIterStreaming<'a, Lock, T> {
     }
 }
 
-pub struct CandyCaneIterStreaming<'a, T: Sync, R: RawRwLock = RwLock> {
-    pub(crate) inner: RawCandyCaneIterStreaming<'a, R, T>,
+pub struct CandyCaneIterStreaming<'a, T: Sync, R: RawRwLock = RwLock, M: RawMutex = parking_lot::RawMutex> {
+    pub(crate) inner: RawCandyCaneIterStreaming<'a, R, M, T>,
 }
 
-impl<'a, T: Sync, R: RawRwLock> CandyCaneIterStreaming<'a, T, R> {
+impl<'a, T: Sync, R: RawRwLock, M: RawMutex> CandyCaneIterStreaming<'a, T, R, M> {
     #[inline]
     pub fn next(&mut self) -> Option<&T> {
         // SAFETY: The internal iterator should only
         // ever be called with `LockGuardType::Read`
         self.inner
-            .next_raw(LockGuardType::Read)
+            .next_raw()
             .map(|x| unsafe { &*x })
     }
 }
 
-pub struct CandyCaneIterStreamingMut<'a, T: Send, R: RawRwLock = RwLock> {
-    pub(crate) inner: RawCandyCaneIterStreaming<'a, R, T>,
+pub struct CandyCaneIterStreamingMut<'a, T: Send, R: RawRwLock = RwLock, M: RawMutex = parking_lot::RawMutex> {
+    pub(crate) inner: RawCandyCaneIterStreaming<'a, R, M, T>,
 }
 
-impl<'a, T: Send, R: RawRwLock> CandyCaneIterStreamingMut<'a, T, R> {
+impl<'a, T: Send, R: RawRwLock, M: RawMutex> CandyCaneIterStreamingMut<'a, T, R, M> {
     #[inline]
     pub fn next(&mut self) -> Option<&mut T> {
         // SAFETY: The internal iterator should only
         // ever be called with `LockGuardType::Write`
         self.inner
-            .next_raw(LockGuardType::Write)
+            .next_raw()
             .map(|x| unsafe { &mut *x })
     }
 }

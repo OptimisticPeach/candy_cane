@@ -1,10 +1,10 @@
-use parking_lot::lock_api::RawRwLock;
+use parking_lot::lock_api::{RawRwLock, RawMutex};
 use crate::RawCandyCane;
 use crate::slice_tracker::SliceTracker;
 use std::sync::atomic::Ordering;
 use std::cell::UnsafeCell;
 
-pub mod normal;
+// pub mod normal;
 pub mod streaming;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -33,12 +33,12 @@ pub(crate) struct ChunkVisit {
 }
 
 impl ChunkVisit {
-    pub fn create_range<'a, Lock: RawRwLock, T, const SLICES: usize>(
+    pub fn create_range<'a, Lock: RawRwLock, M: RawMutex, T, const SLICES: usize>(
         start: usize,
         end: usize,
         slice_buffer: &mut Vec<Self>,
-        buffer: &'a RawCandyCane<Lock, T, SLICES>,
-    ) -> &'a [SliceTracker<Lock, T>] {
+        buffer: &'a RawCandyCane<Lock, M, T, SLICES>,
+    ) -> &'a [SliceTracker<M, T>] {
         let start_slice = buffer.calc_slice_index(start);
         let mut end_slice = buffer.calc_slice_index(end);
         assert!(end_slice >= start_slice);
